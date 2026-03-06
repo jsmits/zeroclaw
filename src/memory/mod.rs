@@ -118,6 +118,14 @@ impl std::fmt::Debug for ResolvedEmbeddingConfig {
     }
 }
 
+fn embedding_provider_env_key(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        _ => None,
+    }
+}
+
 fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
@@ -131,7 +139,11 @@ fn resolve_embedding_config(
         provider: config.embedding_provider.trim().to_string(),
         model: config.embedding_model.trim().to_string(),
         dimensions: config.embedding_dimensions,
-        api_key: fallback_api_key.clone(),
+        api_key: embedding_provider_env_key(config.embedding_provider.trim())
+            .and_then(|var| std::env::var(var).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or(fallback_api_key.clone()),
     };
 
     let Some(hint) = config
@@ -176,7 +188,14 @@ fn resolve_embedding_config(
         provider: provider.to_string(),
         model: model.to_string(),
         dimensions,
-        api_key: routed_api_key.or(fallback_api_key),
+        api_key: routed_api_key
+            .or_else(|| {
+                embedding_provider_env_key(provider)
+                    .and_then(|var| std::env::var(var).ok())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .or(fallback_api_key),
     }
 }
 
@@ -444,6 +463,35 @@ mod tests {
     use crate::config::{EmbeddingRouteConfig, StorageProviderConfig};
     use tempfile::TempDir;
 
+    /// RAII guard that sets/removes an env var and restores the previous value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn factory_sqlite() {
         let tmp = TempDir::new().unwrap();
@@ -616,6 +664,7 @@ mod tests {
 
     #[test]
     fn resolve_embedding_config_uses_base_config_when_model_is_not_hint() {
+        let _guard = EnvGuard::remove("OPENAI_API_KEY");
         let cfg = MemoryConfig {
             embedding_provider: "openai".into(),
             embedding_model: "text-embedding-3-small".into(),
@@ -665,6 +714,7 @@ mod tests {
 
     #[test]
     fn resolve_embedding_config_falls_back_when_hint_is_missing() {
+        let _guard = EnvGuard::remove("OPENAI_API_KEY");
         let cfg = MemoryConfig {
             embedding_provider: "openai".into(),
             embedding_model: "hint:semantic".into(),
@@ -685,7 +735,104 @@ mod tests {
     }
 
     #[test]
+    fn resolve_embedding_config_route_uses_provider_env_var() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", "env-openai-key");
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
+
+        // Env var beats the default config key (which is typically a different provider)
+        let resolved = resolve_embedding_config(&cfg, &routes, Some("anthropic-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("env-openai-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_route_explicit_key_overrides_env_var() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", "env-openai-key");
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1536),
+            api_key: Some("explicit-route-key".into()),
+        }];
+
+        // Route-level explicit key wins over env var and config key
+        let resolved = resolve_embedding_config(&cfg, &routes, Some("anthropic-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("explicit-route-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_route_falls_back_to_config_key_without_env_var() {
+        let _guard = EnvGuard::remove("OPENAI_API_KEY");
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            provider: "openai".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1536),
+            api_key: None,
+        }];
+
+        // No route key, no env var → falls back to config key
+        let resolved = resolve_embedding_config(&cfg, &routes, Some("anthropic-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("anthropic-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_fallback_uses_provider_env_var() {
+        let _guard = EnvGuard::set("OPENAI_API_KEY", "env-openai-key");
+        let cfg = MemoryConfig {
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+
+        // Env var beats the default config key
+        let resolved = resolve_embedding_config(&cfg, &[], Some("anthropic-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("env-openai-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_fallback_uses_config_key_without_env_var() {
+        let _guard = EnvGuard::remove("OPENAI_API_KEY");
+        let cfg = MemoryConfig {
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+
+        // No env var → falls back to config key
+        let resolved = resolve_embedding_config(&cfg, &[], Some("anthropic-key"));
+        assert_eq!(resolved.api_key.as_deref(), Some("anthropic-key"));
+    }
+
+    #[test]
     fn resolve_embedding_config_falls_back_when_route_is_invalid() {
+        let _guard = EnvGuard::remove("OPENAI_API_KEY");
         let cfg = MemoryConfig {
             embedding_provider: "openai".into(),
             embedding_model: "hint:semantic".into(),
